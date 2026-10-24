@@ -1,0 +1,6 @@
+app/.venv/
+app/.idea/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
