@@ -139,48 +139,79 @@ def hedging(
     if not senders:
         raise ValueError("No senders")
 
-    deadline = time.monotonic() + budget.latency_seconds
-    cancel = Event()
-    results: Queue[tuple[Response | None, Exception | None]] = Queue()
+    count = min(len(senders), budget.max_subrequests)
+    if count <= 0:
+        raise RequestTimedOut("Subrequest budget exhausted")
 
-    def launch(sender: Sender) -> None:
+    deadline = time.monotonic() + budget.latency_seconds
+    results: Queue[tuple[int, Response | None, float]] = Queue()
+    cancellations: list[Event] = []
+    subrequest_deadlines: list[float] = []
+
+    def launch(index: int) -> None:
+        cancel = Event()
+        cancellations.append(cancel)
+        started = time.monotonic()
+        subrequest_deadlines.append(
+            min(deadline, started + budget.subrequest_latency_seconds)
+            if budget.subrequest_latency_seconds is not None
+            else deadline
+        )
+
         def worker() -> None:
             try:
-                results.put((sender.send(request, cancel), None))
-            except Exception as error:
-                results.put((None, error))
+                response = senders[index].send(request, cancel)
+            except Exception:
+                response = None
+            results.put((index, response, time.monotonic()))
 
         Thread(target=worker, daemon=True).start()
 
-    launch(senders[0])
+    def wait_for_success(until: float) -> Response | None:
+        while time.monotonic() < until:
+            now = time.monotonic()
 
-    # Если первый ответил успешно до задержки, резервные запросы не нужны
+            for cancel, sub_deadline in zip(cancellations, subrequest_deadlines):
+                if now >= sub_deadline:
+                    cancel.set()
+
+            next_deadline = min(
+                (d for d in subrequest_deadlines if d > now),
+                default=until,
+            )
+            wait_time = max(0, min(until, next_deadline) - now)
+
+            try:
+                index, response, finished_at = results.get(timeout=wait_time)
+            except Empty:
+                continue
+
+            if response is not None and 200 <= response.status_code < 300 and finished_at <= subrequest_deadlines[index]:
+                return response
+
+        return None
+
     try:
-        response, _ = results.get(
-            timeout=min(hedging_delay, max(0, deadline - time.monotonic()))
-        )
-        if response is not None and 200 <= response.status_code < 300:
-            cancel.set()
-            return response
-    except Empty:
-        pass
-
-    for sender in senders[1:]:
-        if time.monotonic() < deadline:
-            launch(sender)
-
-    # Любой первый успешный ответ завершает все ожидания
-    while time.monotonic() < deadline:
-        try:
-            response, _ = results.get(timeout=max(0, deadline - time.monotonic()))
-        except Empty:
-            break
-        if response is not None and 200 <= response.status_code < 300:
-            cancel.set()
+        launch(0)
+        first_wait = min(deadline, time.monotonic() + max(0, hedging_delay))
+        response = wait_for_success(first_wait)
+        if response is not None:
             return response
 
-    cancel.set()
-    raise RequestTimedOut("Request latency budget exhausted")
+        for index in range(1, count):
+            if time.monotonic() >= deadline:
+                break
+            launch(index)
+
+        response = wait_for_success(deadline)
+        if response is not None:
+            return response
+
+        raise RequestTimedOut("Request latency budget exhausted")
+    finally:
+        for cancel in cancellations:
+            cancel.set()
+
 
 # Создать функцию round-robin с памятью об ошибках каждого сервера
 def circuit_breaker(
