@@ -192,7 +192,7 @@ class HedgingTests(unittest.TestCase):
     def test_fast_first_does_not_launch_other_requests(self):
         senders = [FakeSender([Response(200)]), FakeSender([Response(200)])]
         result = multi_client(
-            REQUEST, senders, Budget(0.3), hedging, hedging_delay=0.05,
+            REQUEST, senders, Budget(0.3, max_subrequests=2), hedging, hedging_delay=0.05,
         )
         self.assertEqual(result.status_code, 200)
         self.assertEqual([s.calls for s in senders], [1, 0])
@@ -201,7 +201,7 @@ class HedgingTests(unittest.TestCase):
         slow = FakeSender([Response(200)], delay=1)
         fast = FakeSender([Response(200)])
         result = multi_client(
-            REQUEST, [slow, fast], Budget(0.3), hedging, hedging_delay=0.02,
+            REQUEST, [slow, fast], Budget(0.3, max_subrequests=2), hedging, hedging_delay=0.02,
         )
         self.assertEqual(result.status_code, 200)
         self.assertEqual([slow.calls, fast.calls], [1, 1])
@@ -211,7 +211,7 @@ class HedgingTests(unittest.TestCase):
         bad = FakeSender([Response(503)])
         good = FakeSender([Response(200)])
         result = multi_client(
-            REQUEST, [bad, good], Budget(0.3), hedging, hedging_delay=0.1,
+            REQUEST, [bad, good], Budget(0.3, max_subrequests=2), hedging, hedging_delay=0.1,
         )
         self.assertEqual(result.status_code, 200)
         self.assertEqual([bad.calls, good.calls], [1, 1])
@@ -220,15 +220,56 @@ class HedgingTests(unittest.TestCase):
         senders = [FakeSender([Response(503)]), FakeSender([Response(404)])]
         with self.assertRaises(RequestTimedOut):
             multi_client(
-                REQUEST, senders, Budget(0.03), hedging, hedging_delay=0.005,
+                REQUEST, senders, Budget(0.03, max_subrequests=2), hedging, hedging_delay=0.005,
             )
+        self.assertEqual([s.calls for s in senders], [1, 1])
+
+    def test_max_subrequests_limits_parallel_launches(self):
+        senders = [FakeSender([Response(200)], delay=1) for _ in range(3)]
+        with self.assertRaises(RequestTimedOut):
+            multi_client(
+                REQUEST, senders, Budget(0.06, max_subrequests=1),
+                hedging, hedging_delay=0.01,
+            )
+        self.assertEqual([s.calls for s in senders], [1, 0, 0])
+
+    def test_subrequest_timeout_rejects_late_success(self):
+        # Проверяем даже отправителя, который не обрабатывает сигнал отмены.
+        class SlowSender(Sender):
+            def __init__(self):
+                self.calls = 0
+
+            def send(self, request, cancel):
+                self.calls += 1
+                time.sleep(0.06)
+                return Response(200)
+
+        slow = SlowSender()
+        bad = FakeSender([Response(503)])
+        with self.assertRaises(RequestTimedOut):
+            multi_client(
+                REQUEST, [slow, bad],
+                Budget(0.12, subrequest_latency_seconds=0.02, max_subrequests=2),
+                hedging, hedging_delay=0.005,
+            )
+        self.assertEqual([slow.calls, bad.calls], [1, 1])
+
+    def test_subrequest_timeout_cancels_each_sender(self):
+        senders = [FakeSender([Response(200)], delay=0.3) for _ in range(2)]
+        with self.assertRaises(RequestTimedOut):
+            multi_client(
+                REQUEST, senders,
+                Budget(0.09, subrequest_latency_seconds=0.02, max_subrequests=2),
+                hedging, hedging_delay=0.005,
+            )
+        self.assertTrue(all(s.cancelled.wait(0.2) for s in senders))
         self.assertEqual([s.calls for s in senders], [1, 1])
 
     def test_all_slow_senders_are_cancelled(self):
         senders = [FakeSender([Response(200)], delay=1) for _ in range(3)]
         with self.assertRaises(RequestTimedOut):
             multi_client(
-                REQUEST, senders, Budget(0.05), hedging, hedging_delay=0.01,
+                REQUEST, senders, Budget(0.05, max_subrequests=3), hedging, hedging_delay=0.01,
             )
         self.assertEqual([s.calls for s in senders], [1, 1, 1])
         self.assertTrue(all(s.cancelled.wait(0.3) for s in senders))
